@@ -255,26 +255,33 @@ def make_ipca_table_base(extra_meses=None):
 
 
 def make_ipca_table_completa(extra_meses=None):
-    """Tabela de VNA que inclui o mês anterior ao d_fech_vna para interpolação correta."""
-    lista = []
-    if extra_meses:
-        lista.extend(extra_meses)
-    # Âncora no mês anterior
-    table = [{'data_ref': None, 'data_fechamento': d_fech_vna_ant, 'variacao': 0.0, 'vna': vna_ant},
-             {'data_ref': None, 'data_fechamento': d_fech_vna,     'variacao': 0.0, 'vna': vna_base}]
-    # Adiciona os meses projetados
+    """
+    Tabela de VNA com âncora dupla (mês anterior + mês base) para interpolação correta.
+    
+    IMPORTANTE: filtra automaticamente meses cujo fechamento já está coberto pelo
+    vna_base (d_fech_vna). Evita dupla contagem quando Focus retorna meses já divulgados.
+    """
+    table = [
+        {'data_ref': None, 'data_fechamento': d_fech_vna_ant, 'variacao': 0.0, 'vna': vna_ant},
+        {'data_ref': None, 'data_fechamento': d_fech_vna,     'variacao': 0.0, 'vna': vna_base},
+    ]
     vna = vna_base
-    for mes_ano, var_pct in (lista or []):
+    for mes_ano, var_pct in (extra_meses or []):
         try:
             partes = mes_ano.strip().split('/')
             mes, ano = int(partes[0]), int(partes[1])
-            vna = vna * (1 + var_pct / 100.0)
+            # Calcula data de fechamento deste mês
             if mes == 12:
                 data_fech = date(ano + 1, 1, 15)
             else:
                 data_fech = date(ano, mes + 1, 15)
             while not is_business_day(data_fech):
                 data_fech += timedelta(days=1)
+            # ── FILTRO CRÍTICO: ignora meses já cobertos pelo VNA base ──
+            # Se o fechamento deste mês <= d_fech_vna, já está embutido no vna_base
+            if data_fech <= d_fech_vna:
+                continue
+            vna = vna * (1 + var_pct / 100.0)
             table.append({'data_ref': date(ano, mes, 15),
                            'data_fechamento': data_fech,
                            'variacao': var_pct, 'vna': vna})
@@ -383,12 +390,27 @@ with tab1:
 
     if modo_ipca == "Focus (mediana)":
         if focus.get('ok') and focus.get('ipca_mensal'):
-            ipca_list_main = [(item['data_referencia'],
-                               float(item.get('mediana') or item.get('media') or 0))
-                              for item in focus['ipca_mensal']
-                              if item.get('data_referencia')]
-            st.markdown(f"<div class='sbox'>✅ {len(ipca_list_main)} meses carregados do Focus</div>",
-                        unsafe_allow_html=True)
+            # Filtra apenas meses FUTUROS ao d_fech_vna (evita dupla contagem)
+            ipca_list_main = []
+            for item in focus['ipca_mensal']:
+                ref = item.get('data_referencia', '')
+                if not ref:
+                    continue
+                try:
+                    partes = ref.split('/')
+                    mes, ano = int(partes[0]), int(partes[1])
+                    # Data de fechamento desse mês do Focus
+                    if mes == 12:
+                        fech = date(ano + 1, 1, 15)
+                    else:
+                        fech = date(ano, mes + 1, 15)
+                    # Só inclui se fechamento > d_fech_vna (mês ainda não embutido no VNA base)
+                    if fech > d_fech_vna:
+                        ipca_list_main.append((ref, float(item.get('mediana') or item.get('media') or 0)))
+                except Exception:
+                    continue
+            st.markdown(f"<div class='sbox'>✅ {len(ipca_list_main)} meses futuros carregados do Focus "
+                        f"(a partir de {d_fech_vna:%m/%Y})</div>", unsafe_allow_html=True)
         else:
             st.markdown("<div class='wbox'>⚠️ Focus indisponível — usando defaults</div>",
                         unsafe_allow_html=True)
@@ -642,11 +664,21 @@ with tab2:
 
     if fonte_mam == "Focus (mediana)":
         if focus.get('ok') and focus.get('ipca_mensal'):
-            ipca_list_mam = [(item['data_referencia'],
-                              float(item.get('mediana') or item.get('media') or 0))
-                             for item in focus['ipca_mensal']
-                             if item.get('data_referencia')]
-            st.markdown(f"<div class='sbox'>✅ IPCA Focus: {len(ipca_list_mam)} meses</div>",
+            ipca_list_mam = []
+            for item in focus['ipca_mensal']:
+                ref = item.get('data_referencia', '')
+                if not ref:
+                    continue
+                try:
+                    partes = ref.split('/')
+                    mes, ano = int(partes[0]), int(partes[1])
+                    fech = date(ano, mes + 1, 15) if mes < 12 else date(ano + 1, 1, 15)
+                    # Só inclui meses futuros ao VNA base (evita dupla contagem)
+                    if fech > d_fech_vna:
+                        ipca_list_mam.append((ref, float(item.get('mediana') or item.get('media') or 0)))
+                except Exception:
+                    continue
+            st.markdown(f"<div class='sbox'>✅ IPCA Focus: {len(ipca_list_mam)} meses futuros</div>",
                         unsafe_allow_html=True)
         else:
             ipca_list_mam = [(m, DEFAULTS_IPCA.get(m, 0.30)) for m in meses_futuros_mam[:24]]
@@ -790,114 +822,75 @@ with tab2:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 3 — CURVAS DE JUROS (ETTJ via pyettj)
+# TAB 3 — CURVAS DE JUROS (ETTJ via B3)
 # ════════════════════════════════════════════════════════════════════════════
 
 with tab3:
-    st.markdown("<div class='sec'>📉 ETTJ — Curvas de Juros (via pyettj / B3)</div>",
+    st.markdown("<div class='sec'>📉 ETTJ — Curvas de Juros (B3)</div>",
                 unsafe_allow_html=True)
     st.markdown("""<div class='ibox'>
-    Curvas pré (PRE) e juro real (DI × IPCA / NTN-B) da B3, buscadas via
-    <b>pyettj</b>. Compara a última data disponível com uma semana atrás e
-    um ano atrás. Os dados são do dia útil anterior (nunca projetados).
+    Curvas <b>Pré</b> (LTN / NTN-F) e <b>IPCA</b> (NTN-B / DI × IPCA) da B3.
+    Compara a última data disponível com uma semana atrás e um ano atrás.
+    Dados do dia útil anterior — nunca projetados.
     </div>""", unsafe_allow_html=True)
 
     col_tc1, col_tc2, col_tc3 = st.columns(3)
     with col_tc1:
-        d_ref_c = st.date_input("Referência (atual)", value=last_business_day(), key="drc")
+        d_ref_c   = st.date_input("Data atual",        value=last_business_day(),           key="drc")
     with col_tc2:
-        d_sem_ant = st.date_input("Semana anterior",
-                                   value=last_business_day(d_ref_c, n=4), key="dsa")
+        d_sem_ant = st.date_input("Semana anterior",   value=last_business_day(d_ref_c, n=4), key="dsa")
     with col_tc3:
-        d_ano_ant = st.date_input("1 ano atrás",
-                                   value=last_business_day_1y_ago(d_ref_c), key="daa")
+        d_ano_ant = st.date_input("1 ano atrás",       value=last_business_day_1y_ago(d_ref_c), key="daa")
 
-    tipo_ettj = st.selectbox("Curva", ["PRE", "DI x IPCA", "Ambas"])
+    col_sel, col_btn = st.columns([2, 1])
+    with col_sel:
+        tipo_ettj = st.radio("Curvas a exibir", ["Pré", "IPCA", "Ambas"],
+                              horizontal=True)
+    with col_btn:
+        btn_ettj = st.button("🔄 Buscar curvas (B3)", use_container_width=True,
+                              type="primary")
 
-    col_b1, col_b2 = st.columns([1, 3])
-    with col_b1:
-        btn_ettj = st.button("🔄 Buscar curvas (B3)", use_container_width=True, type="primary")
-
-    # Estado das curvas
+    # ── Busca ──
     if btn_ettj:
-        with st.spinner("Buscando curvas na B3 via pyettj..."):
+        with st.spinner("Buscando curvas na B3..."):
             st.session_state['ettj_atual']   = get_ettj_b3(d_ref_c)
             st.session_state['ettj_sem_ant'] = get_ettj_b3(d_sem_ant)
             st.session_state['ettj_ano_ant'] = get_ettj_b3(d_ano_ant)
-        if st.session_state['ettj_atual'].empty:
-            st.markdown("<div class='wbox'>⚠️ pyettj não retornou dados. Use entrada manual abaixo.</div>",
+        ok = not st.session_state['ettj_atual'].empty
+        if ok:
+            st.markdown("<div class='sbox'>✅ Curvas carregadas com sucesso.</div>",
+                        unsafe_allow_html=True)
+        else:
+            st.markdown("<div class='wbox'>⚠️ B3 não retornou dados para esta data. "
+                        "Tente outra data (dia útil recente).</div>",
                         unsafe_allow_html=True)
 
     ettj_atual   = st.session_state.get('ettj_atual',   pd.DataFrame())
     ettj_sem_ant = st.session_state.get('ettj_sem_ant', pd.DataFrame())
     ettj_ano_ant = st.session_state.get('ettj_ano_ant', pd.DataFrame())
 
-    # ── Entrada manual ──
-    with st.expander("📝 Entrada manual de curva (quando pyettj indisponível)"):
-        st.markdown("**Vértices em dias úteis → taxa (% a.a.) para cada data**")
-        vert_du = [21, 42, 63, 126, 252, 378, 504, 756, 1008, 1260, 1764, 2520]
-        anos_approx = [round(v/252, 1) for v in vert_du]
-
-        st.markdown("*Pré (PRE):*")
-        col_labs = st.columns(len(vert_du))
-        pre_at, pre_sa, pre_aa = [], [], []
-        for i, (v, a) in enumerate(zip(vert_du, anos_approx)):
-            with col_labs[i]:
-                st.markdown(f"<div style='text-align:center;font-size:.7rem;color:#64748b'><b>{a}a</b></div>",
-                            unsafe_allow_html=True)
-                base = selic_ini - 1 + i * 0.15
-                pre_at.append(st.number_input(f"prA_{v}", value=round(base,2), step=0.01,
-                                               format="%.2f", key=f"prA_{v}", label_visibility="collapsed"))
-                pre_sa.append(st.number_input(f"prS_{v}", value=round(base-0.3,2), step=0.01,
-                                               format="%.2f", key=f"prS_{v}", label_visibility="collapsed"))
-                pre_aa.append(st.number_input(f"prAa_{v}", value=round(base+1.5,2), step=0.01,
-                                               format="%.2f", key=f"prAa_{v}", label_visibility="collapsed"))
-
-        venc_real = [2027, 2028, 2030, 2032, 2035, 2040, 2045, 2050, 2055]
-        st.markdown("*Juro Real (NTN-B / DI×IPCA):*")
-        col_real = st.columns(len(venc_real))
-        real_at, real_sa, real_aa = [], [], []
-        for i, v in enumerate(venc_real):
-            with col_real[i]:
-                st.markdown(f"<div style='text-align:center;font-size:.7rem;color:#64748b'><b>{v}</b></div>",
-                            unsafe_allow_html=True)
-                base_r = yield_b5 + i * 0.03
-                real_at.append(st.number_input(f"rlA_{v}", value=round(base_r,4), step=0.01,
-                                                format="%.4f", key=f"rlA_{v}", label_visibility="collapsed"))
-                real_sa.append(st.number_input(f"rlS_{v}", value=round(base_r-0.2,4), step=0.01,
-                                                format="%.4f", key=f"rlS_{v}", label_visibility="collapsed"))
-                real_aa.append(st.number_input(f"rlAa_{v}", value=round(base_r+1.2,4), step=0.01,
-                                                format="%.4f", key=f"rlAa_{v}", label_visibility="collapsed"))
-
-        usar_manual_ettj = st.checkbox("Usar entrada manual", value=ettj_atual.empty)
-
-    # ── Monta DFs de curva ──
-    hoje_ano = d_ref_c.year
-
-    if usar_manual_ettj or ettj_atual.empty:
-        df_pre_at  = pd.DataFrame({'prazo_anos': [v/252 for v in vert_du], 'taxa': pre_at})
-        df_pre_sa  = pd.DataFrame({'prazo_anos': [v/252 for v in vert_du], 'taxa': pre_sa})
-        df_pre_aa  = pd.DataFrame({'prazo_anos': [v/252 for v in vert_du], 'taxa': pre_aa})
-        df_real_at = pd.DataFrame({'venc': venc_real, 'taxa': real_at,
-                                    'prazo_anos': [v - hoje_ano + 0.5 for v in venc_real]})
-        df_real_sa = pd.DataFrame({'venc': venc_real, 'taxa': real_sa,
-                                    'prazo_anos': [v - hoje_ano + 0.5 for v in venc_real]})
-        df_real_aa = pd.DataFrame({'venc': venc_real, 'taxa': real_aa,
-                                    'prazo_anos': [v - hoje_ano + 0.5 for v in venc_real]})
-    else:
+    # ── Extrai curvas ──
+    # B3 usa "DI x IPCA" internamente; exibimos como "IPCA" para o usuário
+    if not ettj_atual.empty:
         df_pre_at  = parse_ettj_for_curve(ettj_atual,   'PRE')
         df_pre_sa  = parse_ettj_for_curve(ettj_sem_ant, 'PRE')
         df_pre_aa  = parse_ettj_for_curve(ettj_ano_ant, 'PRE')
-        df_real_at = parse_ettj_for_curve(ettj_atual,   'DI x IPCA')
-        df_real_sa = parse_ettj_for_curve(ettj_sem_ant, 'DI x IPCA')
-        df_real_aa = parse_ettj_for_curve(ettj_ano_ant, 'DI x IPCA')
+        df_ipca_at = parse_ettj_for_curve(ettj_atual,   'DI x IPCA')
+        df_ipca_sa = parse_ettj_for_curve(ettj_sem_ant, 'DI x IPCA')
+        df_ipca_aa = parse_ettj_for_curve(ettj_ano_ant, 'DI x IPCA')
+    else:
+        df_pre_at  = df_pre_sa  = df_pre_aa  = pd.DataFrame()
+        df_ipca_at = df_ipca_sa = df_ipca_aa = pd.DataFrame()
 
+    # ── Função de plot ──
     def plot_curva_3datas(df_at, df_sa, df_aa, x_col, titulo, label_x,
                           lab_at, lab_sa, lab_aa, linha_ref=None):
         fig = go.Figure()
-        estilos = [(df_at, lab_at, '#0369a1', 'circle',  2.5, None),
-                   (df_sa, lab_sa, '#f59e0b', 'square',  2.0, 'dash'),
-                   (df_aa, lab_aa, '#94a3b8', 'diamond', 1.5, 'dot')]
+        estilos = [
+            (df_at, lab_at, '#0369a1', 'circle',  2.5, None),
+            (df_sa, lab_sa, '#f59e0b', 'square',  2.0, 'dash'),
+            (df_aa, lab_aa, '#94a3b8', 'diamond', 1.5, 'dot'),
+        ]
         for df_, lbl, cor, sym, wid, dash in estilos:
             if df_ is None or df_.empty:
                 continue
@@ -929,80 +922,80 @@ with tab3:
             xaxis=dict(
                 title=dict(text=label_x, font=dict(size=12, color='#374151')),
                 tickfont=dict(size=11, color='#374151'),
-                gridcolor='#e5e7eb',
-                showgrid=True,
-                tickangle=-30,
-                linecolor='#d1d5db',
-                linewidth=1,
+                gridcolor='#e5e7eb', showgrid=True,
+                tickangle=-30, linecolor='#d1d5db', linewidth=1,
             ),
             yaxis=dict(
                 title=dict(text='Taxa (% a.a.)', font=dict(size=12, color='#374151')),
                 tickfont=dict(size=11, color='#374151'),
-                ticksuffix='%',
-                gridcolor='#e5e7eb',
-                showgrid=True,
-                zeroline=False,
-                linecolor='#d1d5db',
-                linewidth=1,
+                ticksuffix='%', gridcolor='#e5e7eb', showgrid=True,
+                zeroline=False, linecolor='#d1d5db', linewidth=1,
             ),
             legend=dict(
                 bgcolor='rgba(255,255,255,0.95)',
-                bordercolor='#e2e8f0',
-                borderwidth=1,
+                bordercolor='#e2e8f0', borderwidth=1,
                 font=dict(size=11, color='#1e293b'),
-                orientation='h',
-                y=1.12, x=0, xanchor='left',
+                orientation='h', y=1.12, x=0, xanchor='left',
             ),
         )
         return fig
 
-    # Define x_col_real antes dos blocos condicionais para evitar NameError
-    x_col_real = ('venc' if not df_real_at.empty and 'venc' in df_real_at.columns
+    # ── Curva IPCA ──
+    x_col_ipca = ('venc' if not df_ipca_at.empty and 'venc' in df_ipca_at.columns
                   else 'prazo_anos')
 
-    if tipo_ettj in ["Juro Real (NTN-B)", "DI x IPCA", "Ambas"]:
-        x_col_real = 'venc' if 'venc' in df_real_at.columns else 'prazo_anos'
-        fig_real = plot_curva_3datas(
-            df_real_at, df_real_sa, df_real_aa, x_col_real,
-            "ETTJ Juro Real — NTN-B / DI × IPCA", "Vencimento",
-            f"Atual ({d_ref_c:%d/%m/%Y})",
-            f"Semana ant. ({d_sem_ant:%d/%m/%Y})",
-            f"1 ano atrás ({d_ano_ant:%d/%m/%Y})",
-            (yield_b5, f"IMA-B5 atual: {yield_b5:.4f}%"))
-        st.plotly_chart(fig_real, use_container_width=True)
+    if tipo_ettj in ["IPCA", "Ambas"]:
+        if df_ipca_at.empty:
+            st.markdown("<div class='wbox'>⚠️ Clique em <b>Buscar curvas</b> para carregar os dados.</div>",
+                        unsafe_allow_html=True)
+        else:
+            fig_ipca = plot_curva_3datas(
+                df_ipca_at, df_ipca_sa, df_ipca_aa, x_col_ipca,
+                "Curva IPCA — NTN-B", "Prazo (d.u.)",
+                f"Atual ({d_ref_c:%d/%m/%Y})",
+                f"Semana ant. ({d_sem_ant:%d/%m/%Y})",
+                f"1 ano atrás ({d_ano_ant:%d/%m/%Y})",
+                (yield_b5, f"IMA-B5 atual: {yield_b5:.4f}%"))
+            st.plotly_chart(fig_ipca, use_container_width=True)
 
-    if tipo_ettj in ["PRE", "Ambas"]:
-        x_col_pre = 'prazo_anos'
-        fig_pre = plot_curva_3datas(
-            df_pre_at, df_pre_sa, df_pre_aa, x_col_pre,
-            "ETTJ Pré — LTN / NTN-F", "Prazo (anos)",
-            f"Atual ({d_ref_c:%d/%m/%Y})",
-            f"Semana ant. ({d_sem_ant:%d/%m/%Y})",
-            f"1 ano atrás ({d_ano_ant:%d/%m/%Y})")
-        st.plotly_chart(fig_pre, use_container_width=True)
+    # ── Curva Pré ──
+    if tipo_ettj in ["Pré", "Ambas"]:
+        if df_pre_at.empty:
+            st.markdown("<div class='wbox'>⚠️ Clique em <b>Buscar curvas</b> para carregar os dados.</div>",
+                        unsafe_allow_html=True)
+        else:
+            fig_pre = plot_curva_3datas(
+                df_pre_at, df_pre_sa, df_pre_aa, 'prazo_anos',
+                "Curva Pré — LTN / NTN-F", "Prazo (anos)",
+                f"Atual ({d_ref_c:%d/%m/%Y})",
+                f"Semana ant. ({d_sem_ant:%d/%m/%Y})",
+                f"1 ano atrás ({d_ano_ant:%d/%m/%Y})")
+            st.plotly_chart(fig_pre, use_container_width=True)
 
-    # Variação semanal — x_col_real já definido acima
-    x_col_real_safe = x_col_real
-    if not df_real_at.empty and not df_real_sa.empty:
-        st.markdown("**📊 Variação semanal da curva real (bps)**")
-        n = min(len(df_real_at), len(df_real_sa))
-        x_v = df_real_at.iloc[:n][x_col_real_safe].values
-        delta_v = (df_real_at.iloc[:n]['taxa'].values -
-                   df_real_sa.iloc[:n]['taxa'].values) * 100
+    # ── Variação semanal da curva IPCA ──
+    if not df_ipca_at.empty and not df_ipca_sa.empty:
+        st.markdown("**📊 Variação semanal — Curva IPCA (bps)**")
+        n = min(len(df_ipca_at), len(df_ipca_sa))
+        x_v    = df_ipca_at.iloc[:n][x_col_ipca].values
+        delta_v = (df_ipca_at.iloc[:n]['taxa'].values -
+                   df_ipca_sa.iloc[:n]['taxa'].values) * 100
         fig_delta = go.Figure(go.Bar(
             x=x_v, y=delta_v,
             marker_color=['#ef4444' if v > 0 else '#22c55e' for v in delta_v],
             text=[f"{v:+.1f}" for v in delta_v], textposition='outside'))
         fig_delta.add_hline(y=0, line=dict(color='#94a3b8', width=1))
         fig_delta.update_layout(
-            **PLOT_LAYOUT, height=270, showlegend=False,
-            xaxis=dict(title='Vencimento', gridcolor='#e2e8f0',
-                       tickfont=dict(size=11, color='#1e293b'),
-                       title_font=dict(color='#1e293b')),
-            yaxis=dict(title='Δ (bps)', gridcolor='#e2e8f0',
-                       tickfont=dict(size=11, color='#1e293b'),
-                       title_font=dict(color='#1e293b')),
-            title=dict(text="Variação semanal por vencimento (bps)",
+            template='plotly_white',
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='#fafafa',
+            height=270, showlegend=False,
+            margin=dict(t=50, b=30, l=10, r=10),
+            xaxis=dict(title=dict(text='Prazo (d.u.)', font=dict(color='#374151')),
+                       tickfont=dict(size=11, color='#374151'),
+                       gridcolor='#e5e7eb'),
+            yaxis=dict(title=dict(text='Δ (bps)', font=dict(color='#374151')),
+                       tickfont=dict(size=11, color='#374151'),
+                       gridcolor='#e5e7eb'),
+            title=dict(text="Variação semanal por vértice — Curva IPCA (bps)",
                        font=dict(size=12, color='#0f172a')))
         st.plotly_chart(fig_delta, use_container_width=True)
 
