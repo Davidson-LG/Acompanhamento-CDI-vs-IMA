@@ -4,9 +4,6 @@ numpy
 plotly
 requests
 python-dateutil
-pyettj
 beautifulsoup4
 lxml
 html5lib
-scipy
-matplotlib

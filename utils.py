@@ -337,27 +337,162 @@ def fetch_focus_all():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ETTJ via pyettj (B3)
+# ETTJ — busca direta na B3 (sem pyettj, usa apenas requests + beautifulsoup4)
+# Mesma lógica interna do pyettj, sem as dependências pesadas (scipy, matplotlib)
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _b3_get_table(main_table) -> pd.DataFrame:
+    """
+    Replica o parser do pyettj.gettables.get_table() usando apenas bs4.
+    Extrai uma tabela HTML da B3 em DataFrame com vértices × curvas.
+    """
+    table_names, sub_table_names = [], []
+    dados, dados2 = [], []
+    tabela = pd.DataFrame()
+
+    for row in main_table.find_all('td'):
+        row_str = str(row)
+        txt = row.text.strip().replace('\r', ' ').replace('\n', ' ').replace('  ', ' ')
+        if 'tabelaTitulo' in row_str and 'rowspan' in row_str:
+            table_names.append(txt)
+        elif 'tabelaTitulo' in row_str and 'colspan="1"' in row_str:
+            table_names.append(txt)
+        elif 'tabelaTitulo' in row_str and 'colspan="2"' in row_str:
+            table_names.append(txt); table_names.append(txt)
+        elif 'tabelaItem' in row_str:
+            sub_table_names.append(txt)
+        elif 'tabelaConteudo1' in row_str:
+            dados.append(txt)
+            if len(dados) == len(table_names):
+                tabela = pd.concat([tabela, pd.DataFrame(dados).T])
+                dados = []
+        elif 'tabelaConteudo2' in row_str:
+            dados2.append(txt)
+            if len(dados2) == len(table_names):
+                tabela = pd.concat([tabela, pd.DataFrame(dados2).T])
+                dados2 = []
+
+    if tabela.empty or not table_names:
+        return pd.DataFrame()
+
+    tn = table_names
+    tn_part1 = [tn[i+1] if tn[i] == '' else tn[i] for i in range(len(tn)-1)]
+    tn_part2 = tn_part1 + [tn[-1]]
+    new_sub = [x + str(i) if sub_table_names.count(x) == 2 else x
+               for i, x in enumerate(sub_table_names)]
+    colunas = [tn_part2[0]] + [i + ' ' + j for i, j in zip(tn_part2[1:], new_sub)]
+    colunas = [x.split('(')[0].split(')')[0].strip() for x in colunas]
+
+    tabela.columns = colunas
+    for i, col in enumerate(tabela.columns.tolist()):
+        if i == 0:
+            tabela[col] = pd.to_numeric(tabela[col], errors='coerce')
+        else:
+            tabela[col] = pd.to_numeric(
+                tabela[col].astype(str).str.replace(',', '.'), errors='coerce')
+    return tabela.dropna(subset=[tabela.columns[0]])
+
 
 def get_ettj_b3(data_ref: date, curva: str = "TODOS") -> pd.DataFrame:
     """
-    Busca ETTJ da B3 via pyettj.
-    Retorna DataFrame vazio se não conseguir (sandbox/rede).
-    Curvas comuns: 'PRE', 'DI X IPCA', 'TODOS'
+    Busca ETTJ da B3 diretamente (sem pyettj).
+    Requer apenas: requests, beautifulsoup4, lxml/html5lib.
+    Retorna DataFrame com curvas nas colunas e vértices (du) no índice.
     """
     try:
-        from pyettj import get_ettj
-        df = get_ettj(data_ref.strftime('%Y-%m-%d'), curva)
-        return df
+        from bs4 import BeautifulSoup
+        data_fmt = data_ref.strftime('%m/%d/%Y')
+        curva_up = curva.upper()
+
+        if curva_up == 'TODOS':
+            url = (f"https://www2.bmf.com.br/pages/portal/bmfbovespa/boletim1/"
+                   f"TxRef1.asp?Data={data_fmt}&Data1=20060201&slcTaxa=TODOS")
+        else:
+            url = (f"https://www2.bmf.com.br/pages/portal/bmfbovespa/lumis/"
+                   f"lum-taxas-referenciais-bmf-ptBR.asp"
+                   f"?Data={data_fmt}&Data1=20060201&slcTaxa={curva_up}")
+
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                  'AppleWebKit/537.36 Chrome/120.0 Safari/537.36',
+                   'Accept-Language': 'pt-BR,pt;q=0.9'}
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, 'lxml')
+        tables = soup.find_all('table')
+
+        if len(tables) < 2:
+            return pd.DataFrame()
+
+        if 'Não há dados' in resp.text:
+            return pd.DataFrame()
+
+        if curva_up == 'TODOS':
+            # 4 tabelas: PRE, DI×IPCA, DI×IGPM, DI×TJLP (índices 1-4)
+            partes = []
+            for t in tables[1:5]:
+                df_t = _b3_get_table(t)
+                if not df_t.empty:
+                    partes.append(df_t)
+            if not partes:
+                return pd.DataFrame()
+            # Merge pelo primeiro campo (vértice)
+            result = partes[0]
+            for p in partes[1:]:
+                result = result.merge(p, on=result.columns[0], how='outer')
+            result = result.set_index(result.columns[0])
+            result.index.name = 'Vértice (du)'
+            result['Data'] = data_ref.strftime('%Y-%m-%d')
+            # Remove colunas duplicadas
+            result = result.loc[:, ~result.columns.duplicated()]
+            # Limpa nomes de coluna
+            result.columns = [c.split('(')[0].strip() if '(' in str(c) else str(c)
+                               for c in result.columns]
+            return result
+        else:
+            df_t = pd.read_html(resp.text)[0]
+            return df_t
+
     except Exception:
         return pd.DataFrame()
 
 
+def parse_ettj_for_curve(df: pd.DataFrame, curva_nome: str) -> pd.DataFrame:
+    """
+    Extrai uma curva do DataFrame retornado por get_ettj_b3().
+    curva_nome: 'PRE', 'DI x IPCA', etc.
+    Retorna DataFrame com colunas: prazo_du, prazo_anos, taxa
+    """
+    if df.empty:
+        return pd.DataFrame()
+    # Busca coluna pelo nome (case-insensitive, parcial)
+    busca = curva_nome.upper().replace(' ', '')
+    cols = [c for c in df.columns
+            if busca in str(c).upper().replace(' ', '')]
+    if not cols:
+        # Tenta match mais amplo
+        partes = curva_nome.upper().split()
+        for p in partes:
+            cols = [c for c in df.columns if p in str(c).upper()]
+            if cols:
+                break
+    if not cols:
+        return pd.DataFrame()
+
+    col = cols[0]
+    sub = df[[col]].copy().reset_index()
+    sub.columns = ['prazo_du', 'taxa']
+    sub = sub.dropna()
+    sub['prazo_du'] = pd.to_numeric(sub['prazo_du'], errors='coerce')
+    sub['taxa']     = pd.to_numeric(sub['taxa'], errors='coerce')
+    sub = sub.dropna()
+    sub['prazo_anos'] = sub['prazo_du'] / 252.0
+    return sub.sort_values('prazo_du').reset_index(drop=True)
+
+
 def last_business_day(ref: date = None, n: int = 0) -> date:
-    """Retorna o n-ésimo dia útil anterior a ref (0 = ontem ou último DU)."""
-    d = ref or date.today()
-    d -= timedelta(days=1)
+    """Retorna o n-ésimo dia útil anterior a ref (0 = ontem/último DU)."""
+    d = (ref or date.today()) - timedelta(days=1)
     steps = 0
     while True:
         if is_business_day(d):
@@ -368,39 +503,14 @@ def last_business_day(ref: date = None, n: int = 0) -> date:
 
 
 def last_business_day_1y_ago(ref: date = None) -> date:
-    """Retorna o último dia útil aproximadamente 1 ano antes de ref."""
+    """Retorna o último dia útil ~1 ano antes de ref."""
     d = ref or date.today()
     d_1y = date(d.year - 1, d.month, d.day)
-    # Busca o DU mais próximo
-    for delta in range(0, 5):
+    for delta in range(5):
         candidate = d_1y - timedelta(days=delta)
         if is_business_day(candidate):
             return candidate
     return d_1y
-
-
-def parse_ettj_for_curve(df: pd.DataFrame, curva_nome: str) -> pd.DataFrame:
-    """
-    Extrai uma curva específica do DataFrame do pyettj.
-    pyettj retorna colunas como 'PRE', 'DI x IPCA', 'DI x IGPM', etc.
-    Cada coluna tem os vértices como índice (ex: 21, 42, 63, ...).
-    Retorna DataFrame com colunas: prazo_du, taxa
-    """
-    if df.empty:
-        return pd.DataFrame()
-    # Normaliza nome
-    cols = [c for c in df.columns if curva_nome.upper() in str(c).upper()]
-    if not cols:
-        return pd.DataFrame()
-    col = cols[0]
-    sub = df[[col]].copy().reset_index()
-    sub.columns = ['prazo_du', 'taxa']
-    sub = sub.dropna()
-    sub['prazo_du'] = pd.to_numeric(sub['prazo_du'], errors='coerce')
-    sub['taxa']     = pd.to_numeric(sub['taxa'], errors='coerce')
-    sub = sub.dropna()
-    sub['prazo_anos'] = sub['prazo_du'] / 252.0
-    return sub.sort_values('prazo_du').reset_index(drop=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
