@@ -319,17 +319,29 @@ with tab1:
     if focus.get('ipca_mensal'):
         with st.expander("📋 Ver expectativas Focus IPCA mês a mês"):
             rows_f = []
-            for item in focus['ipca_mensal'][:30]:
-                rows_f.append({'Referência': item['data_referencia'],
+            for item in focus['ipca_mensal']:
+                ref = item.get('data_referencia', '')
+                if not ref:
+                    continue
+                # Parse MM/YYYY para ordenação correta
+                try:
+                    partes = ref.split('/')
+                    sort_key = int(partes[1]) * 100 + int(partes[0])
+                except Exception:
+                    sort_key = 0
+                rows_f.append({'_sort': sort_key,
+                                'Referência': ref,
                                 'Mediana (%)': item.get('mediana'),
                                 'Média (%)':   item.get('media'),
                                 'Mínimo (%)':  item.get('minimo'),
                                 'Máximo (%)':  item.get('maximo')})
-            df_focus_show = pd.DataFrame(rows_f)
+            rows_f.sort(key=lambda x: x['_sort'])
+            df_focus_show = pd.DataFrame([{k: v for k, v in r.items() if k != '_sort'}
+                                           for r in rows_f])
             st.dataframe(df_focus_show.style.format({
                 'Mediana (%)': '{:.2f}', 'Média (%)': '{:.2f}',
                 'Mínimo (%)': '{:.2f}', 'Máximo (%)': '{:.2f}',
-            }, na_rep='—'), use_container_width=True, height=280)
+            }, na_rep='—'), use_container_width=True, height=300)
 
     # ── Tabela Focus COPOM ──
     if focus.get('selic_copom'):
@@ -662,8 +674,12 @@ with tab2:
 
     def build_mam(d_start, d_end, y_b5, du_b5, y_b5p, du_b5p, var_bps, ip_tab):
         rows = []
+        # Começa no primeiro dia útil do mês de d_start
+        # mas nunca antes de d_start para evitar interpolação fora do âmbito
         cur = date(d_start.year, d_start.month, 1)
-        while not is_business_day(cur):
+        # Avança para o primeiro dia útil >= d_start
+        cur = max(cur, d_start)
+        while cur <= d_end and not is_business_day(cur):
             cur += timedelta(days=1)
 
         while cur < d_end:
@@ -879,32 +895,65 @@ with tab3:
     def plot_curva_3datas(df_at, df_sa, df_aa, x_col, titulo, label_x,
                           lab_at, lab_sa, lab_aa, linha_ref=None):
         fig = go.Figure()
-        estilos = [(df_at, lab_at, '#0ea5e9', 'circle',   2.5, None),
-                   (df_sa, lab_sa, '#f59e0b', 'square',   2,   'dash'),
-                   (df_aa, lab_aa, '#94a3b8', 'diamond',  1.5, 'dot')]
+        estilos = [(df_at, lab_at, '#0369a1', 'circle',  2.5, None),
+                   (df_sa, lab_sa, '#f59e0b', 'square',  2.0, 'dash'),
+                   (df_aa, lab_aa, '#94a3b8', 'diamond', 1.5, 'dot')]
         for df_, lbl, cor, sym, wid, dash in estilos:
             if df_ is None or df_.empty:
                 continue
-            kw = dict(color=cor, width=wid)
+            lkw = dict(color=cor, width=wid)
             if dash:
-                kw['dash'] = dash
+                lkw['dash'] = dash
             fig.add_trace(go.Scatter(
                 name=lbl, x=df_[x_col], y=df_['taxa'],
                 mode='lines+markers',
-                line=kw,
-                marker=dict(size=7, symbol=sym, color=cor)))
+                line=lkw,
+                marker=dict(size=8, symbol=sym, color=cor,
+                            line=dict(color='white', width=1)),
+                hovertemplate=f'<b>{lbl}</b><br>%{{x}}: %{{y:.4f}}%<extra></extra>'))
         if linha_ref:
             fig.add_hline(y=linha_ref[0],
-                          line=dict(color='#ef4444', width=1.2, dash='dot'),
+                          line=dict(color='#dc2626', width=1.4, dash='dot'),
                           annotation_text=linha_ref[1],
-                          annotation_font_color='#ef4444')
+                          annotation_font_color='#dc2626',
+                          annotation_font_size=11)
         fig.update_layout(
-            **PLOT_LAYOUT, height=430,
-            xaxis=dict(title=label_x, gridcolor='#e2e8f0', tickangle=-30),
-            yaxis=dict(title='Taxa (% a.a.)', ticksuffix='%', gridcolor='#e2e8f0'),
+            **PLOT_LAYOUT, height=450,
+            xaxis=dict(
+                title=dict(text=label_x, font=dict(size=12, color='#374151')),
+                tickfont=dict(size=11, color='#374151'),
+                gridcolor='#e5e7eb',
+                showgrid=True,
+                tickangle=-30,
+                linecolor='#d1d5db',
+                linewidth=1,
+            ),
+            yaxis=dict(
+                title=dict(text='Taxa (% a.a.)', font=dict(size=12, color='#374151')),
+                tickfont=dict(size=11, color='#374151'),
+                ticksuffix='%',
+                gridcolor='#e5e7eb',
+                showgrid=True,
+                zeroline=False,
+                linecolor='#d1d5db',
+                linewidth=1,
+            ),
+            legend=dict(
+                bgcolor='rgba(255,255,255,0.95)',
+                bordercolor='#e2e8f0',
+                borderwidth=1,
+                font=dict(size=11, color='#1e293b'),
+                orientation='h',
+                y=1.10, x=0, xanchor='left',
+            ),
             hovermode='x unified',
-            title=dict(text=titulo, font=dict(size=13, color='#0f172a')))
+            title=dict(text=titulo, font=dict(size=13, color='#0f172a')),
+        )
         return fig
+
+    # Define x_col_real antes dos blocos condicionais para evitar NameError
+    x_col_real = ('venc' if not df_real_at.empty and 'venc' in df_real_at.columns
+                  else 'prazo_anos')
 
     if tipo_ettj in ["Juro Real (NTN-B)", "DI x IPCA", "Ambas"]:
         x_col_real = 'venc' if 'venc' in df_real_at.columns else 'prazo_anos'
@@ -927,11 +976,12 @@ with tab3:
             f"1 ano atrás ({d_ano_ant:%d/%m/%Y})")
         st.plotly_chart(fig_pre, use_container_width=True)
 
-    # Variação semanal
+    # Variação semanal — x_col_real já definido acima
+    x_col_real_safe = x_col_real
     if not df_real_at.empty and not df_real_sa.empty:
         st.markdown("**📊 Variação semanal da curva real (bps)**")
         n = min(len(df_real_at), len(df_real_sa))
-        x_v = df_real_at.iloc[:n][x_col_real].values
+        x_v = df_real_at.iloc[:n][x_col_real_safe].values
         delta_v = (df_real_at.iloc[:n]['taxa'].values -
                    df_real_sa.iloc[:n]['taxa'].values) * 100
         fig_delta = go.Figure(go.Bar(
@@ -941,7 +991,12 @@ with tab3:
         fig_delta.add_hline(y=0, line=dict(color='#94a3b8', width=1))
         fig_delta.update_layout(
             **PLOT_LAYOUT, height=270, showlegend=False,
-            yaxis=dict(title='Δ (bps)', gridcolor='#e2e8f0'),
+            xaxis=dict(title='Vencimento', gridcolor='#e2e8f0',
+                       tickfont=dict(size=11, color='#1e293b'),
+                       title_font=dict(color='#1e293b')),
+            yaxis=dict(title='Δ (bps)', gridcolor='#e2e8f0',
+                       tickfont=dict(size=11, color='#1e293b'),
+                       title_font=dict(color='#1e293b')),
             title=dict(text="Variação semanal por vencimento (bps)",
                        font=dict(size=12, color='#0f172a')))
         st.plotly_chart(fig_delta, use_container_width=True)
@@ -1186,11 +1241,18 @@ with tab4:
     st.markdown("---")
     st.markdown("### 📈 Retorno Esperado por Cenário")
 
-    # Usa retornos do tab1 (já calculados)
+    # Usa retornos do tab1 (calculados acima — Streamlit executa tabs em sequência)
+    # Guard: garante que as variáveis existem mesmo se tab1 não calculou
+    _zero = {'retorno_total': 0.0}
+    _r1 = r1 if 'r1' in dir() else (_zero, _zero, 0.0)
+    _r2 = r2 if 'r2' in dir() else (_zero, _zero, 0.0)
+    _r3 = r3 if 'r3' in dir() else (_zero, _zero, 0.0)
+    _ipca_c = ipca_c if 'ipca_c' in dir() else [0.025, 0.025, 0.025]
+
     rets_cen = {
-        '🟢 Fechamento':  (r1[0]['retorno_total'], r1[2]),
-        '🟡 Manutenção':  (r2[0]['retorno_total'], r2[2]),
-        '🔴 Abertura':    (r3[0]['retorno_total'], r3[2]),
+        '🟢 Fechamento':  (_r1[0]['retorno_total'], _r1[2]),
+        '🟡 Manutenção':  (_r2[0]['retorno_total'], _r2[2]),
+        '🔴 Abertura':    (_r3[0]['retorno_total'], _r3[2]),
     }
 
     rows_aloc = []
@@ -1270,8 +1332,8 @@ with tab4:
     for col_, lbl in zip(res_cols, rets_cen.keys()):
         ret_b5_v, ret_cdi_v = rets_cen[lbl]
         ret_nom = pct_imab5_at * ret_b5_v + pct_cdi_at * ret_cdi_v
-        ipca_v  = ipca_c[0] if "Fechamento" in lbl else (
-                  ipca_c[1] if "Manutenção" in lbl else ipca_c[2])
+        ipca_v  = _ipca_c[0] if "Fechamento" in lbl else (
+                  _ipca_c[1] if "Manutenção" in lbl else _ipca_c[2])
         ret_real = (1+ret_nom)/(1+ipca_v)-1
         col_.metric(lbl, f"{ret_nom*100:.2f}% nominal", f"{ret_real*100:.2f}% real")
 
