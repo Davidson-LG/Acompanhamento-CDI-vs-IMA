@@ -198,6 +198,10 @@ def get_ipca_mensal_daily(d_inicio: date, d_fim: date,
     if vi and vf and vi > 0:
         return vf / vi - 1.0
     return 0.0
+
+
+def build_ipca_table(ipca_list: list, vna_base: float,
+                     data_fech_base: date) -> list:
     """
     Constrói tabela VNA projetada.
 
