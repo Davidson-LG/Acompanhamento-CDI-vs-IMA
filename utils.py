@@ -104,7 +104,100 @@ def calc_ipca_periodo(data_inicio: date, data_fim: date, ipca_table: list) -> fl
     return (vf / vi) - 1.0 if vi > 0 else 0.0
 
 
-def build_ipca_table(ipca_list: list, vna_base: float, data_fech_base: date) -> list:
+def build_daily_vna(fech_anchors: list, vna_base: float, d_fech_base: date) -> dict:
+    """
+    Constrói tabela VNA diária por interpolação de dias úteis entre fechamentos.
+    
+    Metodologia ANBIMA: o IPCA mensal é distribuído uniformemente sobre os dias
+    úteis do período entre duas datas de fechamento consecutivas.
+    
+    fech_anchors : [(data_fechamento, vna), ...] — fechamentos futuros
+    vna_base     : VNA na data_fech_base (último mês divulgado)
+    d_fech_base  : data de fechamento do último IPCA divulgado
+    
+    Retorna: {date: vna_value}
+    """
+    anchors = [(d_fech_base, vna_base)] + fech_anchors
+    anchors.sort(key=lambda x: x[0])
+
+    daily: dict = {}
+    for i in range(len(anchors) - 1):
+        d_start, v_start = anchors[i]
+        d_end,   v_end   = anchors[i + 1]
+        # Dias úteis do dia SEGUINTE ao fechamento anterior até o fechamento atual (inclusive)
+        next_day = d_start + timedelta(days=1)
+        bdays = business_days_list(next_day, d_end)
+        n = len(bdays)
+        if not n:
+            daily[d_start] = v_start
+            continue
+        factor = (v_end / v_start) ** (1.0 / n)
+        v = v_start
+        daily[d_start] = v_start
+        for d in bdays:
+            v *= factor
+            daily[d] = v
+    # Garante que o último âncora está registrado
+    if anchors:
+        daily[anchors[-1][0]] = anchors[-1][1]
+    return daily
+
+
+def build_fech_anchors_from_list(ipca_list: list, vna_base: float,
+                                  d_fech_base: date) -> list:
+    """
+    Converte lista de (mes_str, var_pct) em lista de (data_fech, vna)
+    para uso em build_daily_vna(), filtrando meses já cobertos pelo vna_base.
+    """
+    anchors = []
+    vna = vna_base
+    for mes_ano, var_pct in ipca_list:
+        try:
+            partes = mes_ano.strip().split('/')
+            mes, ano = int(partes[0]), int(partes[1])
+            if mes == 12:
+                data_fech = date(ano + 1, 1, 15)
+            else:
+                data_fech = date(ano, mes + 1, 15)
+            while not is_business_day(data_fech):
+                data_fech += timedelta(days=1)
+            # Só inclui meses futuros ao vna_base
+            if data_fech <= d_fech_base:
+                continue
+            vna = vna * (1 + var_pct / 100.0)
+            anchors.append((data_fech, vna))
+        except Exception:
+            continue
+    return anchors
+
+
+def get_ipca_mensal_daily(d_inicio: date, d_fim: date,
+                          daily_vna: dict) -> float:
+    """
+    Calcula o IPCA acumulado no período usando a tabela VNA diária.
+    Se as datas não estão na tabela, usa interpolação linear.
+    """
+    if not daily_vna:
+        return 0.0
+
+    def get_vna(d):
+        if d in daily_vna:
+            return daily_vna[d]
+        # Fallback: busca o dia útil mais próximo
+        for delta in range(1, 8):
+            d2 = d - timedelta(days=delta)
+            if d2 in daily_vna:
+                return daily_vna[d2]
+            d3 = d + timedelta(days=delta)
+            if d3 in daily_vna:
+                return daily_vna[d3]
+        return None
+
+    vi = get_vna(d_inicio)
+    vf = get_vna(d_fim)
+    if vi and vf and vi > 0:
+        return vf / vi - 1.0
+    return 0.0
     """
     Constrói tabela VNA projetada.
 
@@ -395,66 +488,122 @@ def _b3_get_table(main_table) -> pd.DataFrame:
 
 def get_ettj_b3(data_ref: date, curva: str = "TODOS") -> pd.DataFrame:
     """
-    Busca ETTJ da B3 diretamente (sem pyettj).
-    Requer apenas: requests, beautifulsoup4, lxml/html5lib.
+    Busca ETTJ da B3 diretamente via requests + beautifulsoup4.
     Retorna DataFrame com curvas nas colunas e vértices (du) no índice.
+    Em caso de falha, retorna DataFrame vazio com coluna 'erro' explicando o motivo.
     """
     try:
         from bs4 import BeautifulSoup
         data_fmt = data_ref.strftime('%m/%d/%Y')
-        curva_up = curva.upper()
 
-        if curva_up == 'TODOS':
-            url = (f"https://www2.bmf.com.br/pages/portal/bmfbovespa/boletim1/"
-                   f"TxRef1.asp?Data={data_fmt}&Data1=20060201&slcTaxa=TODOS")
-        else:
-            url = (f"https://www2.bmf.com.br/pages/portal/bmfbovespa/lumis/"
-                   f"lum-taxas-referenciais-bmf-ptBR.asp"
-                   f"?Data={data_fmt}&Data1=20060201&slcTaxa={curva_up}")
+        url = (f"https://www2.bmf.com.br/pages/portal/bmfbovespa/boletim1/"
+               f"TxRef1.asp?Data={data_fmt}&Data1=20060201&slcTaxa=TODOS")
 
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                                  'AppleWebKit/537.36 Chrome/120.0 Safari/537.36',
-                   'Accept-Language': 'pt-BR,pt;q=0.9'}
-        resp = requests.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
+        headers = {
+            'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                           'AppleWebKit/537.36 (KHTML, like Gecko) '
+                           'Chrome/120.0.0.0 Safari/537.36'),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+            'Referer': 'https://www2.bmf.com.br/',
+        }
+        resp = requests.get(url, headers=headers, timeout=25)
 
-        soup = BeautifulSoup(resp.text, 'lxml')
+        if resp.status_code != 200:
+            err = pd.DataFrame({'erro': [f'HTTP {resp.status_code}']})
+            return err
+
+        text = resp.text
+        if 'Não há dados' in text or 'nao ha dados' in text.lower():
+            err = pd.DataFrame({'erro': [f'Sem dados para {data_ref:%d/%m/%Y}']})
+            return err
+
+        # Tenta lxml, fallback para html.parser
+        for parser in ('lxml', 'html.parser', 'html5lib'):
+            try:
+                soup = BeautifulSoup(text, parser)
+                break
+            except Exception:
+                continue
+
         tables = soup.find_all('table')
-
         if len(tables) < 2:
-            return pd.DataFrame()
+            # Fallback: tenta pandas read_html direto
+            try:
+                dfs = pd.read_html(text, decimal=',', thousands='.')
+                if dfs:
+                    # Procura tabela com dados numéricos (vértices)
+                    for df_try in dfs:
+                        if df_try.shape[0] > 3 and df_try.shape[1] >= 2:
+                            return _ettj_from_readhtml(dfs)
+            except Exception:
+                pass
+            return pd.DataFrame({'erro': [f'HTML sem tabelas para {data_ref:%d/%m/%Y}']})
 
-        if 'Não há dados' in resp.text:
-            return pd.DataFrame()
-
-        if curva_up == 'TODOS':
-            # 4 tabelas: PRE, DI×IPCA, DI×IGPM, DI×TJLP (índices 1-4)
-            partes = []
-            for t in tables[1:5]:
+        # Parser principal: extrai 4 tabelas (PRE, DI×IPCA, DI×IGPM, DI×TJLP)
+        partes = []
+        for t in tables[1:5]:
+            try:
                 df_t = _b3_get_table(t)
-                if not df_t.empty:
+                if not df_t.empty and df_t.shape[0] > 2:
                     partes.append(df_t)
-            if not partes:
-                return pd.DataFrame()
-            # Merge pelo primeiro campo (vértice)
-            result = partes[0]
-            for p in partes[1:]:
-                result = result.merge(p, on=result.columns[0], how='outer')
-            result = result.set_index(result.columns[0])
-            result.index.name = 'Vértice (du)'
-            result['Data'] = data_ref.strftime('%Y-%m-%d')
-            # Remove colunas duplicadas
-            result = result.loc[:, ~result.columns.duplicated()]
-            # Limpa nomes de coluna
-            result.columns = [c.split('(')[0].strip() if '(' in str(c) else str(c)
-                               for c in result.columns]
-            return result
-        else:
-            df_t = pd.read_html(resp.text)[0]
-            return df_t
+            except Exception:
+                continue
 
-    except Exception:
+        if not partes:
+            # Fallback para pandas read_html
+            try:
+                dfs = pd.read_html(text, decimal=',', thousands='.')
+                return _ettj_from_readhtml(dfs)
+            except Exception:
+                return pd.DataFrame({'erro': ['Não foi possível parsear as tabelas']})
+
+        # Merge das partes pelo vértice (primeira coluna)
+        result = partes[0]
+        for p in partes[1:]:
+            try:
+                key = result.columns[0]
+                result = result.merge(p, on=key, how='outer', suffixes=('', f'_{len(result.columns)}'))
+            except Exception:
+                continue
+
+        result = result.set_index(result.columns[0])
+        result.index.name = 'Vértice (du)'
+        result['Data'] = data_ref.strftime('%Y-%m-%d')
+        # Remove colunas duplicadas e limpa nomes
+        result = result.loc[:, ~result.columns.duplicated()]
+        result.columns = [str(c).split('(')[0].strip() for c in result.columns]
+        return result
+
+    except Exception as e:
+        return pd.DataFrame({'erro': [str(e)]})
+
+
+def _ettj_from_readhtml(dfs: list) -> pd.DataFrame:
+    """Fallback: monta DataFrame de ETTJ a partir de pd.read_html."""
+    # Filtra tabelas com vértices numéricos
+    candidates = []
+    for df in dfs:
+        if df.shape[0] < 3 or df.shape[1] < 2:
+            continue
+        first_col = pd.to_numeric(df.iloc[:, 0], errors='coerce')
+        if first_col.notna().sum() > 3:
+            candidates.append(df)
+
+    if not candidates:
         return pd.DataFrame()
+
+    result = candidates[0]
+    result.columns = [str(c) for c in result.columns]
+    result = result.set_index(result.columns[0])
+    for df in candidates[1:]:
+        try:
+            df.columns = [str(c) for c in df.columns]
+            df = df.set_index(df.columns[0])
+            result = result.join(df, how='outer', rsuffix='_dup')
+        except Exception:
+            continue
+    return result
 
 
 def parse_ettj_for_curve(df: pd.DataFrame, curva_nome: str) -> pd.DataFrame:
@@ -465,12 +614,14 @@ def parse_ettj_for_curve(df: pd.DataFrame, curva_nome: str) -> pd.DataFrame:
     """
     if df.empty:
         return pd.DataFrame()
+    # Se é um DataFrame de erro, retorna vazio
+    if 'erro' in df.columns:
+        return pd.DataFrame()
     # Busca coluna pelo nome (case-insensitive, parcial)
     busca = curva_nome.upper().replace(' ', '')
     cols = [c for c in df.columns
             if busca in str(c).upper().replace(' ', '')]
     if not cols:
-        # Tenta match mais amplo
         partes = curva_nome.upper().split()
         for p in partes:
             cols = [c for c in df.columns if p in str(c).upper()]
@@ -488,6 +639,15 @@ def parse_ettj_for_curve(df: pd.DataFrame, curva_nome: str) -> pd.DataFrame:
     sub = sub.dropna()
     sub['prazo_anos'] = sub['prazo_du'] / 252.0
     return sub.sort_values('prazo_du').reset_index(drop=True)
+
+
+def get_ettj_error_msg(df: pd.DataFrame) -> str:
+    """Retorna mensagem de erro do DataFrame de ETTJ, ou string vazia se OK."""
+    if df is None or df.empty:
+        return "Nenhum dado retornado"
+    if 'erro' in df.columns:
+        return str(df['erro'].iloc[0])
+    return ""
 
 
 def last_business_day(ref: date = None, n: int = 0) -> date:

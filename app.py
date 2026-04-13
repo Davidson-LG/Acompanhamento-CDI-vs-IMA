@@ -13,11 +13,13 @@ from datetime import date, timedelta
 from utils import (
     is_business_day, count_business_days, business_days_list, date_plus_du,
     _get_vna_na_data, calc_ipca_periodo, build_ipca_table, build_ipca_table_from_focus,
+    build_daily_vna, build_fech_anchors_from_list, get_ipca_mensal_daily,
     imab5_retorno_total,
     cdi_retorno_com_copom, cdi_retorno_simples,
     build_copom_schedule_from_focus, build_copom_schedule_manual, COPOM_CALENDARIO,
     fetch_focus_all,
-    get_ettj_b3, parse_ettj_for_curve, last_business_day, last_business_day_1y_ago,
+    get_ettj_b3, parse_ettj_for_curve, get_ettj_error_msg,
+    last_business_day, last_business_day_1y_ago,
     fmt_pct, fmt_brl, fmt_brl_short,
 )
 
@@ -257,9 +259,7 @@ def make_ipca_table_base(extra_meses=None):
 def make_ipca_table_completa(extra_meses=None):
     """
     Tabela de VNA com âncora dupla (mês anterior + mês base) para interpolação correta.
-    
-    IMPORTANTE: filtra automaticamente meses cujo fechamento já está coberto pelo
-    vna_base (d_fech_vna). Evita dupla contagem quando Focus retorna meses já divulgados.
+    Filtra meses cujo fechamento já está coberto pelo vna_base.
     """
     table = [
         {'data_ref': None, 'data_fechamento': d_fech_vna_ant, 'variacao': 0.0, 'vna': vna_ant},
@@ -270,15 +270,12 @@ def make_ipca_table_completa(extra_meses=None):
         try:
             partes = mes_ano.strip().split('/')
             mes, ano = int(partes[0]), int(partes[1])
-            # Calcula data de fechamento deste mês
             if mes == 12:
                 data_fech = date(ano + 1, 1, 15)
             else:
                 data_fech = date(ano, mes + 1, 15)
             while not is_business_day(data_fech):
                 data_fech += timedelta(days=1)
-            # ── FILTRO CRÍTICO: ignora meses já cobertos pelo VNA base ──
-            # Se o fechamento deste mês <= d_fech_vna, já está embutido no vna_base
             if data_fech <= d_fech_vna:
                 continue
             vna = vna * (1 + var_pct / 100.0)
@@ -288,6 +285,21 @@ def make_ipca_table_completa(extra_meses=None):
         except Exception:
             continue
     return table
+
+
+def make_daily_vna(ipca_list):
+    """
+    Constrói a tabela VNA diária (dict {date: vna}) usando a metodologia correta:
+    IPCA mensal distribuído sobre dias úteis entre fechamentos consecutivos.
+
+    Inclui o anchor do vna_base (d_fech_vna) explicitamente para garantir
+    que o período d_fech_ant → d_fech_vna seja interpolado separadamente
+    do período d_fech_vna → próximo fechamento.
+    """
+    # Monta lista completa de anchors: [d_fech_vna_ant + d_fech_vna + meses futuros]
+    future_anchors = build_fech_anchors_from_list(ipca_list, vna_base, d_fech_vna)
+    all_anchors    = [(d_fech_vna, vna_base)] + future_anchors
+    return build_daily_vna(all_anchors, vna_ant, d_fech_vna_ant)
 
 
 def build_meses_futuros(n=30):
@@ -694,70 +706,107 @@ with tab2:
                                     step=0.01, format="%.2f", key=f"mam_ip_{ms}")
                 ipca_list_mam.append((ms, v))
 
+    # Constrói tabela VNA diária com metodologia correta
+    daily_vna_mam = make_daily_vna(ipca_list_mam)
+    # Mantém ipca_table_mam para compatibilidade com aba 1
     ipca_table_mam = make_ipca_table_completa(ipca_list_mam)
 
-    # CDI mam — usa Selic com COPOM se disponível
-    def cdi_mes(du_m, d_i, d_f):
-        sched_m = build_copom_schedule_from_focus(
-            focus.get('selic_copom', []), selic_ini, d_i, d_f) if focus.get('ok') else []
+    # CDI mam — usa Selic com COPOM day-by-day
+    copom_sched_mam = build_copom_schedule_from_focus(
+        focus.get('selic_copom', []), selic_ini,
+        date(d_ini.year, d_ini.month, 1), d_fim
+    ) if focus.get('ok') else []
+
+    def cdi_mes(d_i, d_f):
+        sched_m = [c for c in copom_sched_mam if d_i <= c['data'] <= d_f]
         if sched_m:
             return cdi_retorno_com_copom(selic_ini, sched_m, d_i, d_f)
-        return cdi_retorno_simples(selic_ini, du_m)
+        # Selic vigente no início do mês (última reunião antes de d_i)
+        taxa = selic_ini
+        for c in sorted(copom_sched_mam, key=lambda x: x['data']):
+            if c['data'] < d_i:
+                taxa = c['nova_taxa']
+        return cdi_retorno_simples(taxa, len(business_days_list(d_i, d_f)))
 
-    def build_mam(d_start, d_end, y_b5, du_b5, y_b5p, du_b5p, var_bps, ip_tab):
+    def build_mam(d_start, d_end, y_b5, du_b5, y_b5p, du_b5p, var_bps, dvna):
+        """
+        Projeção mês a mês idêntica à planilha:
+        - Meses completos (1º ao último DU do mês)
+        - DU = NETWORKDAYS inclusivo (len business_days_list)
+        - IPCA via VNA diário (metodologia ANBIMA de dias úteis entre fechamentos)
+        """
         rows = []
-        # Começa no primeiro dia útil do mês de d_start
-        # mas nunca antes de d_start para evitar interpolação fora do âmbito
-        cur = date(d_start.year, d_start.month, 1)
-        # Avança para o primeiro dia útil >= d_start
-        cur = max(cur, d_start)
-        while cur <= d_end and not is_business_day(cur):
+        # Começa no 1º dia útil do próximo mês completo
+        # Se d_start é início de mês, usa esse mês; caso contrário, pula para o próximo
+        if d_start.day == 1 or (d_start == date(d_start.year, d_start.month, 1)):
+            mes_ini = date(d_start.year, d_start.month, 1)
+        else:
+            # Vai para o 1º dia do próximo mês
+            if d_start.month == 12:
+                mes_ini = date(d_start.year + 1, 1, 1)
+            else:
+                mes_ini = date(d_start.year, d_start.month + 1, 1)
+
+        cur = mes_ini
+        while not is_business_day(cur):
             cur += timedelta(days=1)
 
-        while cur < d_end:
+        while cur <= d_end:
+            # Fim do mês corrente
             if cur.month == 12:
                 prox = date(cur.year + 1, 1, 1)
             else:
                 prox = date(cur.year, cur.month + 1, 1)
             fim = prox - timedelta(days=1)
             fim = min(fim, d_end)
-            while fim > cur and not is_business_day(fim):
+            while fim >= cur and not is_business_day(fim):
                 fim -= timedelta(days=1)
-            if fim <= cur:
+
+            if fim < cur:
                 cur = prox
                 while not is_business_day(cur) and cur <= d_end:
                     cur += timedelta(days=1)
                 continue
 
-            du_m = count_business_days(cur, fim)
+            # DU: NETWORKDAYS inclusivo (igual à planilha)
+            bdays = business_days_list(cur, fim)
+            du_m  = len(bdays)
             if du_m <= 0:
                 cur = prox
                 continue
 
-            ipca_m = calc_ipca_periodo(cur, fim, ip_tab) if ip_tab else 0.003
-            b5_m   = imab5_retorno_total(y_b5,  du_m, var_bps, du_b5,  ipca_m)
-            b5p_m  = imab5_retorno_total(y_b5p, du_m, var_bps, du_b5p, ipca_m)
-            cdi_m  = cdi_mes(du_m, cur, fim)
+            # IPCA via tabela VNA diária
+            ipca_m = get_ipca_mensal_daily(cur, fim, dvna) if dvna else 0.003
+
+            b5_m  = imab5_retorno_total(y_b5,  du_m, var_bps, du_b5,  ipca_m)
+            b5p_m = imab5_retorno_total(y_b5p, du_m, var_bps, du_b5p, ipca_m)
+            cdi_m = cdi_mes(cur, fim)
+
             melhor = max([('IMA-B5', b5_m['retorno_total']),
                           ('IMA-B5+', b5p_m['retorno_total']),
                           ('CDI', cdi_m)], key=lambda x: x[1])[0]
 
-            rows.append({'Mês': cur.strftime('%b/%Y'), 'Início': cur, 'Fim': fim,
-                         'D.U.': du_m, 'IPCA (%)': ipca_m*100,
-                         'IMA-B5 (%)':  b5_m['retorno_total']*100,
-                         'IMA-B5+ (%)': b5p_m['retorno_total']*100,
-                         'CDI (%)': cdi_m*100,
-                         'Carrego B5 (%)':  b5_m['carrego']*100,
-                         'Marcação B5 (%)': b5_m['marcacao']*100,
-                         'B5 vs CDI (pp)': (b5_m['retorno_total']-cdi_m)*100,
-                         'Melhor': melhor})
+            rows.append({
+                'Mês': cur.strftime('%b/%Y'), 'Início': cur, 'Fim': fim,
+                'D.U.': du_m,
+                'IPCA (%)':    ipca_m * 100,
+                'IMA-B5 (%)':  b5_m['retorno_total'] * 100,
+                'IMA-B5+ (%)': b5p_m['retorno_total'] * 100,
+                'CDI (%)':     cdi_m * 100,
+                'Carrego B5 (%)':  b5_m['carrego'] * 100,
+                'Marcação B5 (%)': b5_m['marcacao'] * 100,
+                'B5 vs CDI (pp)': (b5_m['retorno_total'] - cdi_m) * 100,
+                'Melhor': melhor,
+            })
+
             cur = prox
             while not is_business_day(cur) and cur <= d_end:
                 cur += timedelta(days=1)
+
         return pd.DataFrame(rows)
 
     df_mam = build_mam(d_ini, d_fim, yield_b5, dur_b5, yield_b5p, dur_b5p,
-                       var_mam_bps, ipca_table_mam)
+                       var_mam_bps, daily_vna_mam)
 
     if not df_mam.empty:
         # Gráfico barras mensais
@@ -856,13 +905,16 @@ with tab3:
             st.session_state['ettj_atual']   = get_ettj_b3(d_ref_c)
             st.session_state['ettj_sem_ant'] = get_ettj_b3(d_sem_ant)
             st.session_state['ettj_ano_ant'] = get_ettj_b3(d_ano_ant)
-        ok = not st.session_state['ettj_atual'].empty
-        if ok:
-            st.markdown("<div class='sbox'>✅ Curvas carregadas com sucesso.</div>",
+
+        err_atual = get_ettj_error_msg(st.session_state['ettj_atual'])
+        if not err_atual and not st.session_state['ettj_atual'].empty:
+            cols_disp = [c for c in st.session_state['ettj_atual'].columns if c != 'Data']
+            st.markdown(f"<div class='sbox'>✅ Curvas carregadas: <b>{', '.join(cols_disp)}</b></div>",
                         unsafe_allow_html=True)
         else:
-            st.markdown("<div class='wbox'>⚠️ B3 não retornou dados para esta data. "
-                        "Tente outra data (dia útil recente).</div>",
+            msg = err_atual or "B3 não retornou dados"
+            st.markdown(f"<div class='wbox'>⚠️ Erro ao buscar curvas: <b>{msg}</b><br>"
+                        "Tente um dia útil mais recente. A B3 disponibiliza dados com 1 dia de defasagem.</div>",
                         unsafe_allow_html=True)
 
     ettj_atual   = st.session_state.get('ettj_atual',   pd.DataFrame())
