@@ -918,7 +918,14 @@ with tab3:
                           annotation_font_color='#dc2626',
                           annotation_font_size=11)
         fig.update_layout(
-            **PLOT_LAYOUT, height=450,
+            template='plotly_white',
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='#fafafa',
+            font=dict(color='#1e293b', family='Inter, sans-serif', size=12),
+            height=450,
+            margin=dict(t=70, b=40, l=10, r=10),
+            hovermode='x unified',
+            title=dict(text=titulo, font=dict(size=13, color='#0f172a')),
             xaxis=dict(
                 title=dict(text=label_x, font=dict(size=12, color='#374151')),
                 tickfont=dict(size=11, color='#374151'),
@@ -944,10 +951,8 @@ with tab3:
                 borderwidth=1,
                 font=dict(size=11, color='#1e293b'),
                 orientation='h',
-                y=1.10, x=0, xanchor='left',
+                y=1.12, x=0, xanchor='left',
             ),
-            hovermode='x unified',
-            title=dict(text=titulo, font=dict(size=13, color='#0f172a')),
         )
         return fig
 
